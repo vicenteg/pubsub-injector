@@ -1,41 +1,52 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python2
 
 import argparse
 import datetime
 import json
 import sched
 import time
-import csv
 import sys
+import decimal
+import dataconverters.commas as commas
 
 from dateutil import parser
-from dateutil.tz import tzlocal
 
 from google.cloud import pubsub
 
 
+class JSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime.datetime):
+            return obj.isoformat()
+        if isinstance(obj, decimal.Decimal):
+            return float(obj)
+        if isinstance(obj, datetime.time):
+            return obj.isoformat()
+        if isinstance(obj, str) and obj == "":
+            return None
+        return json.JSONEncoder.default(self, obj)
+
+
 def main():
-    arg_parser = argparse.ArgumentParser(description='Inject CSV or JSON files to Pub/Sub.')
+    arg_parser = argparse.ArgumentParser(
+        description='Inject CSV or JSON files to Pub/Sub.')
     arg_parser.add_argument('--filename', type=str, nargs=1, required=True,
                             help='Filename to inject.')
-    arg_parser.add_argument('--headers', type=str, nargs=1, required=False,
-                            help='Comma-delimited list of headers. Required if CSV does not include headers.')
-    arg_parser.add_argument('--timestamp_field_name', type=str, default='Timestamp', required=False,
-                            help='The script will attempt to parse timestamps in this column. Not required, but you will probably need to set this.')
-    arg_parser.add_argument('--normalize_to_now', action='store_true', default=False, required=False,
-                            help='Use this option if you want to replay data as though it occurred today, in real time.')
+    arg_parser.add_argument('--timestamp-field-name', type=str,
+                            default='Timestamp', required=True,
+                            help='Attempt to parse timestamps in this column.')
+    arg_parser.add_argument('--normalize-to-now', action='store_true',
+                            default=False, required=False,
+                            help='Use this option to replay data as though' +
+                                 'it occurred today, in real time.')
     arg_parser.add_argument('--pubsub-topic', type=str, required=False,
-                            help='Specify a Google Pub/Sub topic to write events to.')
+                            help='Specify a Google Pub/Sub topic to write ' +
+                                 'events to.')
 
     args = arg_parser.parse_args(sys.argv[1:])
 
     filename = args.filename[0]
-    headers = None
 
-    if args.headers:
-        headers = [fieldName.strip() for fieldName in args.headers[0].split(',')]
-
-    previous_timestamp = None
     timestampFieldName = args.timestamp_field_name
     normalizeToNow = args.normalize_to_now
 
@@ -44,10 +55,10 @@ def main():
         client = pubsub.Client()
         topic = client.topic(args.pubsub_topic)
 
-    if not filename.endswith("json"):
-        lines = (csvToJson(filename, headers))
-    else:
+    if filename.endswith("json"):
         lines = iter(open(filename, "r").readlines())
+    else:
+        lines = (csvToJson(filename))
 
     scheduler = sched.scheduler(time.time, time.sleep)
     start_time = None
@@ -59,30 +70,35 @@ def main():
             print(e)
             continue
         try:
-            timestamp = " ".join([d.get(f) for f in timestampFieldName.split(',')])
-            print timestamp
+            timestampFields = timestampFieldName.split(',', 2)
+            t = tuple([(d.get(f)) for f in timestampFields])
+            current_timestamp = parser.parse(t[0])
+            if normalizeToNow:
+                if len(t) == 2:
+                    d[timestampFields[0]] = current_timestamp.date().strftime('%Y-%m-%d')
+                else:
+                    d[timestampFields[0]] = current_timestamp.isoformat()
+            if len(t) == 2:
+                tt = parser.parse(t[1]).time()
+                current_timestamp = current_timestamp.replace(
+                    hour=tt.hour, minute=tt.minute, second=tt.second)
+                if normalizeToNow:
+                    d[timestampFields[1]] = current_timestamp.time().isoformat()
         except KeyError as e:
-            print("The specified timestamp key '{}' does not exist in this line: {}".format(
-                timestampFieldName, line))
-            raise
-
-        # current_timestamp = None
-        try:
-            current_timestamp = parser.parse(timestamp)
-            # print("TS: {}, TZ: {}".format(current_timestamp, current_timestamp.tzinfo))
-        except ValueError as e:
-            print(e)
+            print("The specified timestamp key '{}' " +
+                  "does not exist in this line: {}"
+                  .format(timestampFieldName, line))
             raise
 
         if start_time is None:
             start_time = datetime.datetime.now(current_timestamp.tzinfo).time()
 
-        if normalizeToNow:
-            now = datetime.datetime.now(current_timestamp.tzinfo)
-            current_timestamp = current_timestamp.replace(year=now.year, month=now.month, day=now.day)
-            d[timestampFieldName] = current_timestamp.isoformat()
-        else:
+        if not normalizeToNow:
             current_timestamp = datetime.datetime.now()
+        else:
+            now = datetime.datetime.now(current_timestamp.tzinfo)
+            current_timestamp = current_timestamp.replace(
+                year=now.year, month=now.month, day=now.day)
 
         if normalizeToNow and current_timestamp.time() < start_time:
             continue
@@ -94,7 +110,6 @@ def main():
         line_count += 1
         if line_count % 1000 == 0:
             scheduler.run()
-            # emitRecord(json.dumps(d, sort_keys=True, separators=(',', ':')), delay=delta.total_seconds())
         scheduler.run()
 
 
@@ -103,27 +118,16 @@ def scheduleMessage(timestamp, message, topic=None, scheduler=None):
         fn = topic.publish
     else:
         fn = emitFunction
+
+    print("Scheduling for {}\n{}".format(
+        datetime.datetime.fromtimestamp(timestamp), message))
     scheduler.enterabs(time=timestamp, priority=1, action=fn, argument=message)
 
 
-def csvToJson(inputFilename, headers=None):
-    with open(inputFilename, "r") as f:
-        sample = f.read(10240)
-        dialect = csv.Sniffer().sniff(sample)
-        hasHeaders = csv.Sniffer().has_header(sample)
-
-    csvFile = open(inputFilename, "r")
-    reader = csv.reader(csvFile, dialect)
-
-    if hasHeaders:
-        headers = reader.next()
-
-    if hasHeaders is False and not headers:
-        raise ValueError(
-            "Please provide a list of headers since the file does not appear to include them.",
-            "Column headers are needed to create JSON keys.")
-
-    return iter(json.dumps(dict((zip(headers, fields))), sort_keys=True, separators=(',', ':')) for fields in reader)
+def csvToJson(inputFilename):
+    with open(inputFilename, "rb") as f:
+        records, metadata = commas.parse(f, guess_types=True)
+    return iter([json.dumps(r, cls=JSONEncoder) for r in records])
 
 
 def emitFunction(jsonString):
