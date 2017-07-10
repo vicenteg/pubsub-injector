@@ -7,12 +7,15 @@ from dateutil import parser as dateparser
 import decimal
 import datetime
 import json
+import os
 import random
+import re
 import sched
 import sys
 import time
 
 from google.cloud import pubsub
+from google.cloud import storage
 
 from tabulator import Stream
 from tableschema import infer
@@ -30,6 +33,17 @@ class JSONEncoder(json.JSONEncoder):
         if isinstance(obj, str) and obj == "":
             return None
         return json.JSONEncoder.default(self, obj)
+
+
+def open_local_or_gcs(filename):
+    if filename.startswith("gs://"):
+        path = re.sub('^gs://', '', filename)
+        first_slash_index = path.index('/')
+        bucket = path[0:first_slash_index]
+        blob_path = path[first_slash_index,-1]
+        raise ValueError("Sorry, I don't know how to read from GCS yet.")
+    else:
+        return open(filename)
 
 
 def sample_source(iterable, samplesize):
@@ -62,12 +76,12 @@ def pubsub_emit_fn(data, arguments):
     except KeyError as e:
         raise ValueError("No topic available in keyword arguments.")
 
-    message = json.dumps(data, cls=JSONEncoder)
+    message = json.dumps(data, sort_keys=True, cls=JSONEncoder)
     return topic.publish(message)
 
 
 def default_emit_fn(data, arguments):
-    print(json.dumps(data, cls=JSONEncoder))
+    print(json.dumps(data, sort_keys=True, cls=JSONEncoder))
 
 
 class emitter:
@@ -105,6 +119,13 @@ class emitter:
         new_timestamp = timestamp.replace(year=now.year, month=now.month, day=now.day)
 
         if self.replay:
+            if len(timestamp_fields) == 1:
+                data[self.timestamp_field] = new_timestamp
+            else:
+                data[timestamp_fields[0]] = new_timestamp.date().isoformat()
+                data[timestamp_fields[1]] = new_timestamp.time().isoformat()
+
+        if self.replay:
             if new_timestamp < datetime.datetime.now():
                 # If we are replaying events, skip ones that occurred before the current time.
                 return
@@ -120,6 +141,7 @@ class emitter:
                 t = 0
             s = self.scheduler.enter
 
+        # print("Emit: {}".format(data), file=sys.stderr)
         s(t, 0, self.emit_fn, [data, self.kwargs])
         self.last_timestamp = timestamp
 
@@ -128,12 +150,12 @@ class emitter:
         self.scheduler.run()
 
 
-def generate_headers(filename, passed_headers=[], generate_dummy_headers=False):
-    with open(filename) as f:
+def generate_headers(filename, passed_headers=None, generate_dummy_headers=False):
+    with open_local_or_gcs(filename) as f:
         sample = f.read(10240)
         has_headers = csv.Sniffer().has_header(sample)
 
-    with Stream(filename) as f:
+    with Stream(filename, format="csv") as f:
         if passed_headers:
             headers = passed_headers.split(",")
         elif has_headers:
@@ -148,17 +170,17 @@ def generate_headers(filename, passed_headers=[], generate_dummy_headers=False):
 
 
 def infer_file_schema(filename, headers=[], infer_row_limit=100):
-    with Stream(filename) as f:
+    with Stream(filename, format="csv") as f:
         sample = sample_source(f, infer_row_limit)
         return infer(headers, sample, row_limit=infer_row_limit)
 
 
 def injector(filename, inferred_schema=None, headers=None, timestamp_column=None, topic=None, realtime=False, replay=False):
-    with Stream(filename) as f:
+    with Stream(filename, format="csv") as f:
         if inferred_schema:
             try:
                 schema_obj = Schema(inferred_schema)
-            except exceptions.SchemaValidationError as e:
+            except exceptions.SchemaValidationError:
                 print("Something went wrong inferring the schema. "
                       "Try not inferring the schema with --no-infer-schema.", file=sys.stderr)
                 print("I'll exit now, since there's nothing more I can do.", file=sys.stderr)
@@ -203,7 +225,7 @@ def main():
     parser.add_argument("--realtime", action='store_true', required=False,
                         help="Emit rows using actual deltas between events.")
     parser.add_argument("--replay", action='store_true', required=False,
-                        help="If set, replace the date portion of the timestamp with today, " \
+                        help="If set, replace the date portion of the timestamp with today, "
                              "and emit events occurring after the current time.")
     parser.add_argument("--no-infer-schema", action='store_true', required=False, default=False,
                         help="If schema inference is failing, disable it with this option.")
