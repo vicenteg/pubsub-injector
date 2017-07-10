@@ -1,0 +1,3 @@
+[submodule "tableschema-py"]
+	path = tableschema-py
+	url = git@github.com:vicenteg/tableschema-py.git
