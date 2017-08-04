@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python
 from __future__ import print_function
 
 import argparse
@@ -7,11 +7,11 @@ from dateutil import parser as dateparser
 import decimal
 import datetime
 import json
-import os
 import random
 import re
 import sched
 import sys
+import tempfile
 import time
 
 from google.cloud import pubsub
@@ -34,14 +34,31 @@ class JSONEncoder(json.JSONEncoder):
             return None
         return json.JSONEncoder.default(self, obj)
 
+def download_gcs_file_and_open(gcs_filename):
+    local_download = None
+
+    def __download_gcs_file_and_open(gcs_filename):
+        blob_path = re.sub('gs://', '', gcs_filename)
+        first_slash = blob_path.index('/')
+        bucket_name = blob_path[0:first_slash]
+        blob_filename = blob_path[first_slash+1:]
+        client = storage.Client()
+        bucket = storage.Bucket(client,bucket_name)
+
+        blob = bucket.get_blob(blob_filename)
+        f = tempfile.NamedTemporaryFile()
+        blob.download_to_file(f)
+        f.seek(0)
+        return f
+
+    if not local_download:
+        local_download = __download_gcs_file_and_open(gcs_filename)
+
+    return local_download
 
 def open_local_or_gcs(filename):
     if filename.startswith("gs://"):
-        path = re.sub('^gs://', '', filename)
-        first_slash_index = path.index('/')
-        bucket = path[0:first_slash_index]
-        blob_path = path[first_slash_index,-1]
-        raise ValueError("Sorry, I don't know how to read from GCS yet.")
+        return download_gcs_file_and_open(filename)
     else:
         return open(filename)
 
@@ -51,7 +68,7 @@ def sample_source(iterable, samplesize):
     iterator = iter(iterable)
     # Fill in the first samplesize elements:
     try:
-        for _ in xrange(samplesize):
+        for _ in range(samplesize):
             results.append(iterator.next())
     except StopIteration:
         pass
@@ -152,16 +169,16 @@ class emitter:
 
 def generate_headers(filename, passed_headers=None, generate_dummy_headers=False):
     with open_local_or_gcs(filename) as f:
-        sample = f.read(10240)
+        sample = f.read(10240).decode('utf-8')
         has_headers = csv.Sniffer().has_header(sample)
 
-    with Stream(filename, format="csv") as f:
+    with Stream(open_local_or_gcs(filename), format="csv", headers=has_headers) as f:
         if passed_headers:
             headers = passed_headers.split(",")
         elif has_headers:
-            headers = [h.strip() for h in f.iter().next()]
+            headers = f.headers
         elif generate_dummy_headers:
-            headers = ["column_{}".format(i) for i,c in enumerate(f.iter().next())]
+            headers = ["column_{}".format(i) for i,c in enumerate(f.iter()[0])]
         else:
             print("No headers found. You should pass some in, " +
                   "or let generate them using --generate-dummy-headers.", file=sys.stderr)
@@ -174,9 +191,28 @@ def infer_file_schema(filename, headers=[], infer_row_limit=100):
         sample = sample_source(f, infer_row_limit)
         return infer(headers, sample, row_limit=infer_row_limit)
 
+def json_injector(filename, timestamp_column=None, topic=None, realtime=False, replay=False):
+    with open(filename, "r") as f:
+        emitter_args = {
+            "realtime": realtime,
+            "replay": replay,
+        }
+
+        if topic:
+            emitter_args.update({"topic": topic, "fn": pubsub_emit_fn})
+        else:
+            emitter_args.update({"fn": default_emit_fn})
+        e = emitter(timestamp_field=timestamp_column, **emitter_args)
+
+        for i, row in enumerate(f):
+            e.emit(data=json.loads(row))
+            if i % 1000 == 0:
+                e.run()
+        e.run()
+
 
 def injector(filename, inferred_schema=None, headers=None, timestamp_column=None, topic=None, realtime=False, replay=False):
-    with Stream(filename, format="csv") as f:
+    with Stream(open_local_or_gcs(filename), format="csv") as f:
         if inferred_schema:
             try:
                 schema_obj = Schema(inferred_schema)
@@ -246,18 +282,25 @@ def main():
             print("Exception caught when connecting to PubSub: {}".format(e.message))
             sys.exit(1)
 
-    headers = generate_headers(filename,
-                               passed_headers=args.headers,
-                               generate_dummy_headers=args.generate_dummy_headers)
 
-    if args.no_infer_schema:
-        inferred_schema = None
+    headers = None
+    inferred_schema = None
+    if not filename.endswith('.json'):
+        headers = generate_headers(filename,
+                                   passed_headers=args.headers,
+                                   generate_dummy_headers=args.generate_dummy_headers)
+
+        if args.no_infer_schema:
+            inferred_schema = None
+        else:
+            inferred_schema = infer_file_schema(filename,
+                                                headers=headers,
+                                                infer_row_limit=args.infer_row_limit)
+
+    if filename.endswith('.json'):
+        json_injector(filename,timestamp_column=timestamp_column,topic=topic,replay=args.replay,realtime=args.realtime)
     else:
-        inferred_schema = infer_file_schema(filename,
-                                            headers=headers,
-                                            infer_row_limit=args.infer_row_limit)
-
-    injector(filename,
+        injector(filename,
              inferred_schema=inferred_schema,
              headers=headers,
              timestamp_column=timestamp_column,
