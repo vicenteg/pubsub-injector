@@ -37,7 +37,7 @@ rsa==3.4.2
 six==1.10.0
 unicodecsv==0.14.1
 urllib2==1498656401.94
-urllib3==1.21.1
+urllib3==1.24.2
 webencodings==0.5.1
 wsgiref==0.1.2
 xlrd==1.0.0
