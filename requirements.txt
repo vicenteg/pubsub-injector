@@ -5,7 +5,7 @@ chardet==3.0.4
 dataconverters==0.3
 dill==0.2.6
 enum34==1.1.6
-future==0.16.0
+future==0.18.3
 futures==3.1.1
 gapic-google-cloud-pubsub-v1==0.15.4
 google-auth==1.0.1
